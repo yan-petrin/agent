@@ -1,136 +1,42 @@
-import json
 from anthropic import Anthropic
-import database as db
+from tools import TOOLS, dispatch
 
 client = Anthropic()
 
-TOOLS = [
-    {
-        "name": "create_task",
-        "description": "Создать новую задачу/тикет в агентстве",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string", "description": "Название задачи"},
-                "description": {"type": "string", "description": "Описание задачи"},
-                "assignee": {"type": "string", "description": "Исполнитель задачи"},
-                "deadline": {"type": "string", "description": "Дедлайн в формате YYYY-MM-DD"},
-                "priority": {
-                    "type": "string",
-                    "enum": ["low", "normal", "high", "urgent"],
-                    "description": "Приоритет задачи",
-                },
-            },
-            "required": ["title"],
-        },
-    },
-    {
-        "name": "list_tasks",
-        "description": "Получить список задач с возможностью фильтрации по статусу или исполнителю",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["open", "in_progress", "done", "closed"],
-                    "description": "Фильтр по статусу",
-                },
-                "assignee": {"type": "string", "description": "Фильтр по исполнителю"},
-            },
-        },
-    },
-    {
-        "name": "update_task",
-        "description": "Обновить задачу: статус, исполнителя, приоритет, дедлайн и другие поля",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "task_id": {"type": "integer", "description": "ID задачи"},
-                "title": {"type": "string", "description": "Новое название"},
-                "description": {"type": "string", "description": "Новое описание"},
-                "assignee": {"type": "string", "description": "Новый исполнитель"},
-                "status": {
-                    "type": "string",
-                    "enum": ["open", "in_progress", "done", "closed"],
-                    "description": "Новый статус",
-                },
-                "priority": {
-                    "type": "string",
-                    "enum": ["low", "normal", "high", "urgent"],
-                    "description": "Новый приоритет",
-                },
-                "deadline": {"type": "string", "description": "Новый дедлайн YYYY-MM-DD"},
-            },
-            "required": ["task_id"],
-        },
-    },
-    {
-        "name": "generate_report",
-        "description": "Сгенерировать сводный отчёт о состоянии задач агентства",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["open", "in_progress", "done", "closed"],
-                    "description": "Показать только задачи с этим статусом (опционально)",
-                }
-            },
-        },
-    },
-]
+SYSTEM_PROMPT = """Ты — агент-менеджер маркетингового агентства Hol. Помогаешь управлять работой с блогерами и создателями контента (creators) из Бразилии.
 
-SYSTEM_PROMPT = """Ты — умный агент-менеджер агентства. Помогаешь отслеживать и управлять задачами,
-проектами и делами. Общайся на русском языке.
+Язык общения с пользователем: русский.
+Язык общения с блогерами: бразильский португальский (pt-BR).
 
-Твои возможности:
-- Создавать задачи с исполнителями, дедлайнами и приоритетами
-- Просматривать и фильтровать задачи
-- Обновлять статусы, исполнителей, приоритеты
-- Генерировать отчёты о состоянии дел
+Твои задачи:
+1. **База блогеров** — вести карточки: контакты, платформы, охват, статус сотрудничества, ставки, оплаты.
+   Статусы: prospect → negotiation → active → paused → inactive
+   Этапы в кампании: invited → negotiating → contracted → briefed → published → paid
 
-Статусы задач: open (открыта), in_progress (в работе), done (выполнена), closed (закрыта).
-Приоритеты: low, normal, high, urgent.
+2. **Переводы** — переводи сообщения с бразильского португальского на русский и обратно.
+   Когда пользователь просит написать сообщение блогеру — пиши на pt-BR (бразильский диалект).
 
-Отвечай кратко и по делу. Используй инструменты для работы с задачами."""
+3. **Анализ переписки** — когда пользователь вставляет переписку с блогером:
+   - Переведи ключевые моменты
+   - Извлеки договорённости, запросы, важные детали
+   - Предложи задачи для дальнейших действий
+   - При необходимости — создай задачи через инструменты
 
+4. **Кампании** — создавай кампании, добавляй блогеров, отслеживай этапы, оплаты, публикации.
 
-def _process_tool_call(tool_name: str, tool_input: dict) -> str:
-    if tool_name == "create_task":
-        task = db.create_task(**tool_input)
-        return json.dumps(task, ensure_ascii=False)
+5. **Отчёты** — генерируй отчёты по кампаниям, сохраняй в Google Docs или Google Sheets.
 
-    elif tool_name == "list_tasks":
-        tasks = db.list_tasks(**tool_input)
-        return json.dumps(tasks, ensure_ascii=False)
+6. **Google Workspace** — читай и пиши в Sheets/Docs, смотри файлы на Drive, отправляй письма через Gmail.
 
-    elif tool_name == "update_task":
-        task_id = tool_input.pop("task_id")
-        task = db.update_task(task_id, **tool_input)
-        if task is None:
-            return json.dumps({"error": f"Задача #{task_id} не найдена"}, ensure_ascii=False)
-        return json.dumps(task, ensure_ascii=False)
-
-    elif tool_name == "generate_report":
-        filter_status = tool_input.get("status")
-        all_tasks = db.list_tasks()
-        by_status = {}
-        for t in all_tasks:
-            s = t["status"]
-            by_status.setdefault(s, []).append(t)
-        report = {
-            "total": len(all_tasks),
-            "by_status": {k: len(v) for k, v in by_status.items()},
-            "tasks": db.list_tasks(status=filter_status) if filter_status else all_tasks,
-        }
-        return json.dumps(report, ensure_ascii=False)
-
-    return json.dumps({"error": f"Неизвестный инструмент: {tool_name}"})
+Важные правила:
+- Всегда подтверждай действия (создание, обновление) коротким резюме
+- Если вставлена переписка — сначала переведи и проанализируй, потом предложи действия
+- Финансы ведём в той валюте, в которой указано (USD или BRL — уточняй если неясно)
+- Будь краток, по делу"""
 
 
 class AgencyAgent:
     def __init__(self):
-        # user_id -> list of messages
         self.conversations: dict[int, list] = {}
 
     def chat(self, user_id: int, user_message: str) -> str:
@@ -153,14 +59,12 @@ class AgencyAgent:
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
-                        result = _process_tool_call(block.name, dict(block.input))
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result,
-                            }
-                        )
+                        result = dispatch(block.name, dict(block.input))
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": result,
+                        })
                 messages.append({"role": "assistant", "content": response.content})
                 messages.append({"role": "user", "content": tool_results})
 
@@ -168,8 +72,7 @@ class AgencyAgent:
                 text = "".join(b.text for b in response.content if hasattr(b, "text"))
                 messages.append({"role": "assistant", "content": response.content})
 
-                # Limit history to last 20 messages
-                if len(messages) > 20:
-                    self.conversations[user_id] = messages[-20:]
+                if len(messages) > 30:
+                    self.conversations[user_id] = messages[-30:]
 
                 return text
